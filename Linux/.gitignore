@@ -1,0 +1,38 @@
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+!gradle/wrapper/gradle-wrapper.properties
+
+# IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.fleet/
+
+# Kotlin
+.kotlin/
+
+# OS / editor
+.DS_Store
+*.swp
+*~
+.#*
+
+# Logs / crash dumps
+hs_err_pid*
+replay_pid*
+
+# Local config
+local.properties
+
+# Keychain / signing artifacts
+*.keystore
+*.p12
+*.cer
+notarytool-*.json
+
+# Generated icons (rebuilt from icon/ master)
+icon/AppIcon.iconset/
