@@ -56,8 +56,14 @@ with JNA bindings.
 
 ```bash
 ./gradlew macSafeDmg     # build/compose/binaries/main/dmg/RCForb-1.0.0.dmg
-./gradlew packageZip     # build/compose/binaries/main/zip/RCForb-macos-1.0.0.zip
+./gradlew macSafeZip     # build/compose/binaries/main/zip/RCForb-macos-1.0.0.zip
 ```
+
+Both consume the same signed `.app` produced by `prepareSignedApp`. With
+`RCFORB_SIGN_IDENTITY` + `RCFORB_NOTARY_PROFILE` set, the DMG ships with
+the staple on the DMG itself; the zip ships with the staple on the `.app`
+inside (you can't staple to a zip). Either one runs offline on a target
+Mac with no Gatekeeper prompt.
 
 `./gradlew packageDmg` (Compose Desktop's stock task) is broken on macOS
 Sequoia/Tahoe + JDK 21 because jpackage's mandatory `codesign -s -` step
@@ -104,11 +110,26 @@ needs (JIT, library validation off, mic input), submit to Apple's notary
 service, wait for approval, and staple the ticket to the DMG. Distribute
 the DMG; recipients double-click it and it just runs.
 
-#### Option 2 — Zip + one-time approval (free)
+#### Option 2 — Signed + notarized Zip (recommended for ad-hoc redistribution)
 
-Ship the zip. Tell users to **right-click `RCForb.app` → Open → Open**
-the first time. macOS prompts once, then remembers; subsequent launches
-are instant. This is what most open-source mac apps do.
+Same Developer ID + notary setup as Option 1, but produce a zip instead:
+
+```bash
+export RCFORB_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
+export RCFORB_NOTARY_PROFILE="rcforb-notary"
+./gradlew macSafeZip
+```
+
+The build signs (hardened runtime + entitlements), zips via `ditto -c -k
+--keepParent --sequesterRsrc` (preserves symlinks + signature),
+submits the zip to Apple notary, staples the ticket onto the `.app`
+inside the bundle, then re-zips for distribution. Recipient: unzip,
+double-click — no Gatekeeper prompt, fully offline.
+
+#### Option 2b — Unsigned zip + one-time approval (free)
+
+Ship the unsigned zip. Tell users to **right-click `RCForb.app` → Open
+→ Open** the first time. macOS prompts once, then remembers.
 
 If users prefer Terminal, this also works:
 
