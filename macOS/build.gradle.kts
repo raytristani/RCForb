@@ -188,27 +188,34 @@ tasks.processResources {
     from(dylibFile) { into("native") }
 }
 
-// ---------- Sequoia-safe DMG packaging ----------
+// ---------- Sequoia-safe packaging ----------
 // JDK 21's jpackage runs `codesign -s -` (ad-hoc) on the .app it produces.
 // macOS Sequoia (15+) auto-attaches `com.apple.FinderInfo` /
 // `com.apple.fileprovider.fpfs#P` xattrs to user-created files which codesign
 // refuses to sign. Fix: invoke jpackage ourselves with `--type app-image`,
-// re-bundle the result via `ditto --noextattr --noqtn`, ad-hoc sign the
-// clean copy, and build the DMG via `hdiutil`. This bypasses Compose
-// Desktop's `:createDistributable` / `:packageDmg` entirely.
+// re-bundle the result via `ditto --noextattr --noqtn`, sign the clean copy,
+// and package via `hdiutil` (DMG) or `ditto -c -k` (Zip). This bypasses
+// Compose Desktop's `:createDistributable` / `:packageDmg` entirely.
 val runtimeClasspath: Configuration = configurations.getByName("runtimeClasspath")
 
-val macSafeDmg by tasks.registering {
-    group = "compose desktop"
-    description = "Build a Sequoia-safe ad-hoc-signed DMG (works around jpackage codesign + xattrs)."
-    dependsOn("createRuntimeImage", tasks.named("jar"), tasks.named("processResources"))
+val pkgVersion = "1.0.0"
 
-    val pkgVersion = "1.0.0"
-    val outDmg = layout.buildDirectory.file("compose/binaries/main/dmg/RCForb-$pkgVersion.dmg")
-    outputs.file(outDmg)
+// Shared output: a fully signed RCForb.app (hardened runtime if Developer ID).
+// Both macSafeDmg and macSafeZip consume this. We stage under /tmp to dodge
+// the iCloud Drive file-provider xattrs that break codesign.
+val signedAppStageDir = file("/tmp/rcforb-mac-build/macOS")
+val signedAppFile = signedAppStageDir.resolve("RCForb.app")
+
+val prepareSignedApp by tasks.registering {
+    group = "compose desktop"
+    description = "Build, clean, and codesign RCForb.app (no packaging). Output: /tmp/rcforb-mac-build/macOS/RCForb.app"
+    dependsOn("createRuntimeImage", tasks.named("jar"), tasks.named("processResources"))
 
     val runtimeFiles = runtimeClasspath
     val mainJarTask = tasks.named("jar")
+
+    // Mark output dir so Gradle skips when nothing changed and inputs are stable.
+    outputs.dir(signedAppStageDir)
 
     doLast {
         val javaHome = System.getProperty("java.home")
@@ -221,7 +228,7 @@ val macSafeDmg by tasks.registering {
         // when stripped. codesign refuses to sign anything carrying those
         // xattrs ("resource fork, Finder information, or similar detritus
         // not allowed"). Building under /tmp sidesteps the file provider.
-        val workRoot = file("/tmp/rcforb-mac-build/${project.name}")
+        val workRoot = signedAppStageDir
         workRoot.deleteRecursively()
         workRoot.mkdirs()
 
@@ -467,72 +474,150 @@ val macSafeDmg by tasks.registering {
         }
 
         run("/usr/bin/codesign", "--verify", "--deep", "--strict", cleanApp.absolutePath)
+        println("Signed app ready at: ${cleanApp.absolutePath}")
+    }
+}
 
+// Helper: shell out, capture combined stdout/stderr.
+fun execRun(vararg cmd: String, ignoreFailure: Boolean = false): String {
+    val proc = ProcessBuilder(*cmd).redirectErrorStream(true).start()
+    val out = proc.inputStream.bufferedReader().readText()
+    val rc = proc.waitFor()
+    if (rc != 0 && !ignoreFailure) {
+        throw GradleException("${cmd.joinToString(" ")} failed (exit $rc):\n$out")
+    }
+    return out
+}
+
+// ---------- DMG packaging ----------
+val macSafeDmg by tasks.registering {
+    group = "compose desktop"
+    description = "Build a Sequoia-safe signed (and optionally notarized) DMG."
+    dependsOn(prepareSignedApp)
+
+    val outDmg = layout.buildDirectory.file("compose/binaries/main/dmg/RCForb-$pkgVersion.dmg")
+    outputs.file(outDmg)
+
+    doLast {
+        val isAdHoc = (System.getenv("RCFORB_SIGN_IDENTITY") ?: "-").trim().let { it == "-" || it.isEmpty() }
         val outFile = outDmg.get().asFile
         outFile.parentFile.mkdirs()
         if (outFile.exists()) outFile.delete()
 
-        // Build the DMG in /tmp too — hdiutil writing into iCloud-synced
-        // ~/Desktop has triggered provenance issues during stapling in the
-        // past, and we need a clean spot for notarytool submit anyway.
-        val stagedDmg = workRoot.resolve("RCForb-${pkgVersion}.dmg")
+        // Build the DMG in /tmp — hdiutil into iCloud-synced ~/Desktop has
+        // triggered provenance issues during stapling in the past.
+        val stagedDmg = signedAppStageDir.resolve("RCForb-${pkgVersion}.dmg")
         if (stagedDmg.exists()) stagedDmg.delete()
         println("Creating DMG via hdiutil …")
-        run(
+        execRun(
             "/usr/bin/hdiutil", "create",
             "-volname", "RCForb",
-            "-srcfolder", cleanApp.absolutePath,
+            "-srcfolder", signedAppFile.absolutePath,
             "-ov", "-format", "UDZO",
             stagedDmg.absolutePath
         )
 
-        // Optional notarization step. Triggers automatically when
-        // RCFORB_NOTARY_PROFILE is set (a `xcrun notarytool store-credentials`
-        // keychain profile). After it succeeds we staple the ticket so the
-        // DMG works fully offline on receiving Macs.
+        // Optional notarization. Triggers when RCFORB_NOTARY_PROFILE is set.
+        // Stapling the ticket to the DMG makes it work offline on other Macs.
         val notaryProfile: String? = System.getenv("RCFORB_NOTARY_PROFILE")?.takeIf { it.isNotBlank() }
         if (notaryProfile != null && !isAdHoc) {
-            println("Submitting to Apple notary (profile=$notaryProfile)…")
-            run(
+            println("Submitting DMG to Apple notary (profile=$notaryProfile)…")
+            execRun(
                 "/usr/bin/xcrun", "notarytool", "submit",
                 stagedDmg.absolutePath,
                 "--keychain-profile", notaryProfile,
                 "--wait"
             )
             println("Stapling notarization ticket to DMG …")
-            run("/usr/bin/xcrun", "stapler", "staple", stagedDmg.absolutePath)
-            run("/usr/bin/xcrun", "stapler", "validate", stagedDmg.absolutePath)
+            execRun("/usr/bin/xcrun", "stapler", "staple", stagedDmg.absolutePath)
+            execRun("/usr/bin/xcrun", "stapler", "validate", stagedDmg.absolutePath)
             println("Notarized.")
         } else if (notaryProfile != null && isAdHoc) {
-            println("WARNING: RCFORB_NOTARY_PROFILE is set but signing is ad-hoc — skipping notarization. Set RCFORB_SIGN_IDENTITY first.")
+            println("WARNING: RCFORB_NOTARY_PROFILE is set but signing is ad-hoc — skipping notarization.")
         }
 
-        // Move the (notarized + stapled) DMG into the project build output.
         stagedDmg.copyTo(outFile, overwrite = true)
         println("DMG: ${outFile.absolutePath}")
     }
 }
 
-// ---------- Zip distribution ----------
-// Zip is the simplest path for distributing an *unsigned* (or ad-hoc-signed)
-// app to other Macs without paying for an Apple Developer ID. The user must
-// run a one-time `xattr -dr com.apple.quarantine RCForb.app` after unzipping,
-// or right-click → Open → Open. Documented in macOS/README.md.
-val packageZip by tasks.registering(Zip::class) {
+// ---------- Zip packaging ----------
+// Zip via `ditto -c -k --keepParent --sequesterRsrc`. This is the
+// Apple-recommended packager for signed bundles: it preserves symlinks
+// (the bundled JDK has many under Contents/runtime/Contents/Home/), POSIX
+// permissions, and codesign metadata so the signature still verifies after
+// unzipping on the recipient's Mac. Gradle's stock `Zip` task can't do this.
+//
+// Notarization workflow for zip distribution:
+//   1. Sign the .app (done in prepareSignedApp).
+//   2. Zip it for submission via ditto.
+//   3. Submit the zip to notarytool. (You can't staple a ticket to a zip.)
+//   4. Staple the ticket to the .app inside the bundle.
+//   5. Re-zip the now-stapled .app for distribution.
+// The recipient unzips and double-clicks; Gatekeeper finds the stapled
+// ticket on the .app and approves it, even fully offline.
+val macSafeZip by tasks.registering {
     group = "compose desktop"
-    description = "Package the macOS-safe .app as a zip (no codesign required to distribute)."
-    dependsOn(macSafeDmg) // produces the clean .app at build/compose/mac-safe/RCForb.app
-    archiveBaseName.set("RCForb-macos")
-    archiveVersion.set("1.0.0")
-    destinationDirectory.set(layout.buildDirectory.dir("compose/binaries/main/zip"))
-    from(layout.buildDirectory.dir("compose/mac-safe")) {
-        include("RCForb.app/**")
-    }
-    // Preserve executable bits on the launcher and any nested binaries.
-    eachFile {
-        if (path.endsWith("/MacOS/RCForb") || path.endsWith(".dylib") || path.endsWith("/bin/java")) {
-            mode = 0b111_101_101 // 0755
+    description = "Build a Sequoia-safe signed (and optionally notarized) zip with full bundled JRE + native libs."
+    dependsOn(prepareSignedApp)
+
+    val outZip = layout.buildDirectory.file("compose/binaries/main/zip/RCForb-macos-$pkgVersion.zip")
+    outputs.file(outZip)
+
+    doLast {
+        val isAdHoc = (System.getenv("RCFORB_SIGN_IDENTITY") ?: "-").trim().let { it == "-" || it.isEmpty() }
+        val outFile = outZip.get().asFile
+        outFile.parentFile.mkdirs()
+        if (outFile.exists()) outFile.delete()
+
+        require(signedAppFile.exists()) { "Signed .app missing at ${signedAppFile.absolutePath}" }
+
+        val notaryProfile: String? = System.getenv("RCFORB_NOTARY_PROFILE")?.takeIf { it.isNotBlank() }
+
+        // Stage the submission zip in /tmp (same xattr-avoidance reasoning).
+        val submissionZip = signedAppStageDir.resolve("RCForb-submission-${pkgVersion}.zip")
+        if (submissionZip.exists()) submissionZip.delete()
+
+        println("Creating submission zip via ditto …")
+        execRun(
+            "/usr/bin/ditto",
+            "-c", "-k", "--keepParent", "--sequesterRsrc",
+            signedAppFile.absolutePath,
+            submissionZip.absolutePath
+        )
+
+        if (notaryProfile != null && !isAdHoc) {
+            println("Submitting zip to Apple notary (profile=$notaryProfile)…")
+            execRun(
+                "/usr/bin/xcrun", "notarytool", "submit",
+                submissionZip.absolutePath,
+                "--keychain-profile", notaryProfile,
+                "--wait"
+            )
+            // Stapler attaches the ticket to the .app on disk (you can't
+            // staple a zip). After this, re-zip to capture the stapled .app.
+            println("Stapling notarization ticket to .app …")
+            execRun("/usr/bin/xcrun", "stapler", "staple", signedAppFile.absolutePath)
+            execRun("/usr/bin/xcrun", "stapler", "validate", signedAppFile.absolutePath)
+            println("Notarized + stapled.")
+        } else if (notaryProfile != null && isAdHoc) {
+            println("WARNING: RCFORB_NOTARY_PROFILE is set but signing is ad-hoc — skipping notarization.")
         }
+
+        // Final distribution zip — contains the .app with the stapled ticket
+        // (if notarized). Recipient: unzip + double-click.
+        val finalZip = signedAppStageDir.resolve("RCForb-macos-${pkgVersion}.zip")
+        if (finalZip.exists()) finalZip.delete()
+        println("Creating distribution zip via ditto …")
+        execRun(
+            "/usr/bin/ditto",
+            "-c", "-k", "--keepParent", "--sequesterRsrc",
+            signedAppFile.absolutePath,
+            finalZip.absolutePath
+        )
+
+        finalZip.copyTo(outFile, overwrite = true)
+        println("Zip: ${outFile.absolutePath}")
     }
 }
 
