@@ -96,7 +96,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
-          cd Windows
+          # working-directory: Windows is inherited from defaults — no cd needed.
           gh release upload "${{ steps.tag.outputs.tag }}" \
             build/RCForb-windows-1.0.0.msi \
             build/RCForb-windows-1.0.0.exe \
