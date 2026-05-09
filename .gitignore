@@ -91,3 +91,6 @@ android-release-checklist.md
 *.gcno
 *.gcda
 codecov/
+
+# Linux cross-build gradle cache (Docker-mounted)
+.gradle-cache-linux/

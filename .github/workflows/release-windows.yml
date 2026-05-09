@@ -1,0 +1,95 @@
+name: Release Windows
+
+# Builds the Windows .msi and .exe installers on a windows-latest runner and
+# uploads them as assets to the matching vX.Y.Z release. Trigger by pushing a
+# tag like v1.0.0 (auto) or manually via "Run workflow" with the tag name.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to attach artifacts to (e.g. v1.0.0)"
+        required: true
+        default: "v1.0.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: Windows
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # MSYS2/MinGW64 for x86_64-w64-mingw32-gcc → speex_jni.dll
+      - name: Set up MSYS2 + MinGW64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc
+          path-type: inherit
+
+      # Convert AppIcon.png → AppIcon.ico (Compose Desktop requires .ico).
+      # ImageMagick is preinstalled on windows-latest runners.
+      - name: Generate AppIcon.ico from PNG
+        run: |
+          magick convert "$PWD/icon/AppIcon.png" -define icon:auto-resize=256,128,64,48,32,16 "$PWD/icon/AppIcon.ico"
+          Get-Item "$PWD/icon/AppIcon.ico" | Format-List Name, Length
+
+      - name: Locate MinGW gcc
+        id: gcc
+        shell: msys2 {0}
+        run: echo "path=$(cygpath -w $(which x86_64-w64-mingw32-gcc 2>/dev/null || which gcc))" >> $GITHUB_OUTPUT
+
+      - name: Build .msi + .exe
+        env:
+          RCFORB_MINGW_GCC: ${{ steps.gcc.outputs.path }}
+        run: |
+          ./gradlew --no-daemon clean packageMsi packageExe
+
+      - name: Show artifacts
+        run: |
+          Get-ChildItem -Recurse -Path build/compose/binaries/main -Include *.msi,*.exe | Format-Table FullName, Length
+
+      - name: Rename artifacts for release
+        run: |
+          $msi = Get-ChildItem -Recurse build/compose/binaries/main/msi -Filter *.msi | Select-Object -First 1
+          $exe = Get-ChildItem -Recurse build/compose/binaries/main/exe -Filter *.exe | Select-Object -First 1
+          if ($msi) { Copy-Item $msi.FullName "build/RCForb-windows-1.0.0.msi" }
+          if ($exe) { Copy-Item $exe.FullName "build/RCForb-windows-1.0.0.exe" }
+          Get-ChildItem build/RCForb-windows-1.0.0.* | Format-Table Name, Length
+
+      - name: Determine release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.release_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          cd Windows
+          gh release upload "${{ steps.tag.outputs.tag }}" \
+            build/RCForb-windows-1.0.0.msi \
+            build/RCForb-windows-1.0.0.exe \
+            --clobber
