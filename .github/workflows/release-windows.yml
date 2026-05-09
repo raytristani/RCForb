@@ -59,7 +59,11 @@ jobs:
         env:
           RCFORB_MINGW_GCC: ${{ steps.gcc.outputs.path }}
         run: |
-          ./gradlew --no-daemon clean packageMsi packageExe
+          # Use gradlew.bat explicitly — PowerShell on Windows doesn't
+          # auto-resolve the extensionless unix script, which silently
+          # no-ops with exit 0 (very confusing failure mode).
+          .\gradlew.bat --no-daemon clean packageMsi packageExe
+          if ($LASTEXITCODE -ne 0) { throw "gradle build failed (exit $LASTEXITCODE)" }
 
       - name: Show artifacts
         run: |
