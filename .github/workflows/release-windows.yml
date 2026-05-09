@@ -77,11 +77,15 @@ jobs:
         id: tag
         shell: bash
         run: |
+          # All platform binaries attach to the single vX.Y.Z release page.
+          # Strip any -windows/-linux/-macos suffix from the triggering tag.
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ github.event.inputs.release_tag }}" >> $GITHUB_OUTPUT
+            raw="${{ github.event.inputs.release_tag }}"
           else
-            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+            raw="${GITHUB_REF#refs/tags/}"
           fi
+          base="${raw%-windows}"; base="${base%-linux}"; base="${base%-macos}"
+          echo "tag=$base" >> $GITHUB_OUTPUT
 
       - name: Upload to GitHub Release
         env:
